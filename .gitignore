@@ -1,0 +1,15 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller and installer output
+build/
+dist/
+installer/
+*.spec
+
+# Local application data
+moneykeeper.sqlite3
+moneykeeper.ini
+moneykeeper.pickle

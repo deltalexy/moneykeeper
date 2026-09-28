@@ -1,54 +1,176 @@
-import json
+"""Launcher for the Moneykeeper desktop application."""
+
 import sys
-from PyQt5.QtWidgets import *
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QTextCursor
+
+from moneykeeper_app import run
+
+
+if __name__ == "__main__":
+    sys.exit(run())
+import json
+import sqlite3
+import sys
 import pickle
-import os
+from pathlib import Path
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import Qt, QSettings
+from PyQt5.QtGui import QTextCursor
 from datetime import datetime
 
-class Vals():
+APP_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = APP_DIR / 'moneykeeper.sqlite3'
+LEGACY_PATH = APP_DIR / 'moneykeeper.pickle'
+APP_SETTINGS = QSettings(str(APP_DIR / 'moneykeeper.ini'), QSettings.IniFormat)
 
-    def load(self):
-        newdict = {'budget': 0,
-                     'hold': 0,
-                     'itohold': 0,
-                     'holdniv': 0,
-                     'buffer': 0,
-                     'zicht': 0,
-                     'mastercard': 0,
-                     'bpaid': 0,
-                     'cash': 0,
-                     'inhouse': 0,
-                     'cheques': 0,
-                     'achterkomend': 0,
-                     'achterinfo': '',
-                     'controledatum': '',
-                     'log': ''}
-        if os.path.exists('moneykeeper.pickle'):
-            with open('moneykeeper.pickle', 'rb') as file:
-                valdict = pickle.load(file)
-            listy = list(valdict.keys())
-            for key in listy:
-                if isinstance(valdict[key], float):
-                    valdict[key] = round(valdict[key], 2)
-                if key not in newdict.keys():
-                    valdict.pop(key, None)
-            for key in newdict.keys():
-                if key not in valdict.keys():
-                    valdict[key] = newdict[key]
-            return valdict
-        else:
-            return newdict
+DEFAULT_VALUES = {
+    'budget': 0, 'hold': 0, 'itohold': 0, 'holdniv': 0, 'buffer': 0,
+    'zicht': 0, 'mastercard': 0, 'bpaid': 0, 'cash': 0, 'inhouse': 0,
+    'cheques': 0, 'achterkomend': 0, 'achterinfo': '', 'controledatum': ''
+}
 
-    def save(self):
-        with open('moneykeeper.pickle', 'wb') as file:
-            pickle.dump(self.__dict__, file)
 
+class RestrictedUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError('Legacy data contains an unsupported object')
+
+
+def configure_scrollbars(widget, mode=None):
+    mode = mode or str(APP_SETTINGS.value('scrollbars/mode', 'vertical'))
+    vertical = Qt.ScrollBarAlwaysOff if mode == 'horizontal' else Qt.ScrollBarAsNeeded
+    horizontal = Qt.ScrollBarAlwaysOff if mode == 'vertical' else Qt.ScrollBarAsNeeded
+    widget.setVerticalScrollBarPolicy(vertical)
+    widget.setHorizontalScrollBarPolicy(horizontal)
+
+
+class Database:
+    def __init__(self, path):
+        self.connection = sqlite3.connect(str(path), timeout=10)
+        self.connection.execute('PRAGMA journal_mode=DELETE')
+        self.connection.execute('PRAGMA synchronous=FULL')
+        self.connection.execute(
+            'CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)'
+        )
+        self.connection.execute(
+            'CREATE TABLE IF NOT EXISTS transactions ('
+            'id INTEGER PRIMARY KEY, date TEXT NOT NULL, kind TEXT NOT NULL, '
+            'amount REAL NOT NULL, info TEXT NOT NULL)'
+        )
+        self.connection.execute(
+            'CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)'
+        )
+        self.connection.commit()
+        self.migrate_legacy_file()
+
+    def migrate_legacy_file(self):
+        migrated = self.connection.execute(
+            "SELECT value FROM metadata WHERE key='legacy_imported'"
+        ).fetchone()
+        if migrated:
+            return
+
+        legacy = {}
+        if LEGACY_PATH.exists():
+            with LEGACY_PATH.open('rb') as file:
+                legacy = RestrictedUnpickler(file).load()
+            if not isinstance(legacy, dict):
+                raise ValueError('Legacy pickle must contain a dictionary')
+
+        with self.connection:
+            for key, default in DEFAULT_VALUES.items():
+                value = legacy.get(key, default)
+                self.connection.execute(
+                    'INSERT OR REPLACE INTO app_state(key, value) VALUES (?, ?)',
+                    (key, json.dumps(value))
+                )
+            for line in legacy.get('log', '').splitlines():
+                if not line:
+                    continue
+                fields = line.split('\t', 4)
+                if len(fields) != 5:
+                    raise ValueError('Invalid transaction row in legacy pickle')
+                transaction_id, date, kind, amount, info = fields
+                self.connection.execute(
+                    'INSERT INTO transactions(id, date, kind, amount, info) VALUES (?, ?, ?, ?, ?)',
+                    (int(transaction_id), date, kind, float(amount), info)
+                )
+            self.connection.execute(
+                "INSERT INTO metadata(key, value) VALUES ('legacy_imported', '1')"
+            )
+
+    def load_state(self):
+        state = dict(DEFAULT_VALUES)
+        for key, value in self.connection.execute('SELECT key, value FROM app_state'):
+            if key in state:
+                state[key] = json.loads(value)
+        return state
+
+    def save_state(self, state, transaction_lines=None):
+        rows = []
+        for line in (transaction_lines or '').splitlines():
+            if line:
+                date, kind, amount, info = line.split('\t', 3)
+                rows.append((date, kind, float(amount), info))
+        with self.connection:
+            self.connection.executemany(
+                'INSERT INTO transactions(date, kind, amount, info) VALUES (?, ?, ?, ?)', rows
+            )
+            self.connection.executemany(
+                'INSERT OR REPLACE INTO app_state(key, value) VALUES (?, ?)',
+                [(key, json.dumps(value)) for key, value in state.items()]
+            )
+
+    def transactions(self):
+        return self.connection.execute(
+            'SELECT id, date, kind, amount, info FROM transactions ORDER BY id'
+        ).fetchall()
+
+    def log_text(self):
+        return ''.join(
+            '{}\t{}\t{}\t{}\t{}\n'.format(*row)
+            for row in self.transactions()
+        )
+
+    def replace_transactions(self, text):
+        rows = []
+        for line in text.splitlines():
+            if line:
+                transaction_id, date, kind, amount, info = line.split('\t', 4)
+                rows.append((int(transaction_id), date, kind, float(amount), info))
+        with self.connection:
+            self.connection.execute('DELETE FROM transactions')
+            self.connection.executemany(
+                'INSERT INTO transactions(id, date, kind, amount, info) VALUES (?, ?, ?, ?, ?)', rows
+            )
+
+    def update_transactions(self, lines):
+        rows = []
+        for line in lines:
+            transaction_id, date, kind, amount, info = line.split('\t', 4)
+            rows.append((date, kind, float(amount), info, int(transaction_id)))
+        with self.connection:
+            self.connection.executemany(
+                'UPDATE transactions SET date=?, kind=?, amount=?, info=? WHERE id=?', rows
+            )
+
+
+class Vals:
     def __init__(self):
-        valdict = self.load()
-        for key in valdict.keys():
-            setattr(self, key, valdict[key])
+        self.database = Database(DATABASE_PATH)
+        for key, value in self.database.load_state().items():
+            setattr(self, key, value)
+
+    @property
+    def log(self):
+        return self.database.log_text()
+
+    @log.setter
+    def log(self, value):
+        self.database.replace_transactions(value)
+
+    def save(self, transaction_lines=None):
+        self.database.save_state(
+            {key: getattr(self, key) for key in DEFAULT_VALUES}, transaction_lines
+        )
 
 class Main(QWidget):
 
@@ -86,16 +208,8 @@ class Main(QWidget):
     def save(self):
         self.values.budget += round(self.temp['budget'], 2)
         self.values.hold += round(self.temp['hold'], 2)
-        if self.values.log == "":
-            idcounter = 0
-        else:
-            idcounter = int(self.values.log.split('\n')[-2].split('\t')[0])+1
-        for element in self.temp['log'].split('\n'):
-            if element != '':
-                self.values.log += '\t'.join([str(idcounter), element+'\n'])
-                idcounter += 1
+        self.values.save(self.temp['log'])
         self.temp = {'budget':0, 'hold':0, 'log':''}
-        self.values.save()
         self.reload()
 
     def reset(self):
@@ -213,6 +327,7 @@ class Main(QWidget):
         self.controle = QPushButton('controle')
         self.instellingen = QPushButton('instellingen')
         self.addbox = QTextEdit()
+        configure_scrollbars(self.addbox)
         self.seelogbut = QPushButton('volledig transactielog')
         self.reportbut = QPushButton('report')
         self.searchbut = QPushButton('search')
@@ -265,6 +380,14 @@ class Main(QWidget):
         self.layout.addWidget(self.reportbut, 8,4,1,4)
         self.layout.addWidget(self.searchbut, 8,8,1,4)
         self.setLayout(self.layout)
+        geometry = APP_SETTINGS.value('windows/main/geometry')
+        if geometry:
+            self.restoreGeometry(geometry)
+
+    def closeEvent(self, event):
+        APP_SETTINGS.setValue('windows/main/geometry', self.saveGeometry())
+        APP_SETTINGS.sync()
+        QWidget.closeEvent(self, event)
 
 class Settings(QWidget):
     def changebutclick(self):
@@ -274,6 +397,10 @@ class Settings(QWidget):
         self.values.holdniv =  round(float(self.holdniv.text()),2)
         self.values.buffer =  round(float(self.buffer.text()),2)
         self.values.save()
+        mode = self.scrollmode.currentData()
+        APP_SETTINGS.setValue('scrollbars/mode', mode)
+        APP_SETTINGS.sync()
+        configure_scrollbars(self.mainpage.addbox, mode)
         self.mainpage.reload()
         self.msg = Dialog('Waarden set.', 'info')
         self.msg.show()
@@ -289,6 +416,13 @@ class Settings(QWidget):
         self.itohold = QLineEdit(str(self.values.itohold))
         self.holdniv = QLineEdit(str(self.values.holdniv))
         self.buffer = QLineEdit(str(self.values.buffer))
+        self.scrollmode = QComboBox()
+        self.scrollmode.addItem('Vertical only', 'vertical')
+        self.scrollmode.addItem('Horizontal only', 'horizontal')
+        self.scrollmode.addItem('Both directions', 'both')
+        current_mode = str(APP_SETTINGS.value('scrollbars/mode', 'vertical'))
+        mode_index = self.scrollmode.findData(current_mode)
+        self.scrollmode.setCurrentIndex(mode_index if mode_index >= 0 else 0)
         self.changebut = QPushButton('set waarden')
         self.layout.addWidget(QLabel('budget'), 0,0)
         self.layout.addWidget(self.budget, 0,1)
@@ -300,7 +434,9 @@ class Settings(QWidget):
         self.layout.addWidget(self.holdniv, 3,1)
         self.layout.addWidget(QLabel('buffer'), 4,0)
         self.layout.addWidget(self.buffer, 4,1)
-        self.layout.addWidget(self.changebut, 5,0,1,2)
+        self.layout.addWidget(QLabel('Scrollbars'), 5,0)
+        self.layout.addWidget(self.scrollmode, 5,1)
+        self.layout.addWidget(self.changebut, 6,0,1,2)
 
         self.changebut.clicked.connect(self.changebutclick)
 
@@ -420,6 +556,7 @@ class Logviewer(QWidget):
         self.setWindowTitle('Logviewer')
         self.values = values
         self.logbox = QTextEdit()
+        configure_scrollbars(self.logbox)
         self.logbox.setText(self.values.log)
         self.logbox.moveCursor(QTextCursor.End)
         self.editbut = QPushButton('Bewerk log')
@@ -549,6 +686,7 @@ class Report(QWidget):
         #Scroll Area Properties
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        configure_scrollbars(self.scroll)
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(self.reportwidget)
 
@@ -652,12 +790,9 @@ class Searcher(QWidget):
 
     def editclick(self):
         searchlist = self.resultbox.toPlainText().split('\n')
-        loglist = self.values.log.split('\n')
-        for line in searchlist:
-            linelist = line.split('\t')
-            loglist[int(linelist[0])] = line
-        log = '\n'.join(loglist)
-        self.values.log = log
+        self.values.database.update_transactions(
+            [line for line in searchlist if line]
+        )
         self.values.save()
         self.list = self.listcreate()
         self.msg = Dialog('Log bewerkt', 'info')
@@ -678,6 +813,7 @@ class Searcher(QWidget):
         self.strings = QLineEdit()
         self.but = QPushButton('Search')
         self.resultbox = QTextEdit()
+        configure_scrollbars(self.resultbox)
         self.reportbut = QPushButton('Deelraport')
         self.editbut = QPushButton('Bewerk log')
 
@@ -704,7 +840,12 @@ class Searcher(QWidget):
         self.layout.addWidget(self.editbut, 9,4,1,3)
         self.setLayout(self.layout)
 
-app = QApplication([])
-mainpage = Main()
-mainpage.show()
-sys.exit(app.exec())
+def main():
+    app = QApplication(sys.argv)
+    mainpage = Main()
+    mainpage.show()
+    return app.exec()
+
+
+if __name__ == '__main__':
+    sys.exit(main())
