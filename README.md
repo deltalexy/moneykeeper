@@ -46,7 +46,7 @@ This builds the executable first and creates `installer\Moneykeeper-Setup.exe`. 
 
 ## Data and sync
 
-`moneykeeper.sqlite3` and `moneykeeper.ini` are kept beside the launcher. The INI file is managed through Qt `QSettings`; the existing window geometry setting is preserved. The original `moneykeeper.pickle` is retained as an untouched archive. A restricted, one-time importer reads it only when the database has no existing ledger rows.
+`moneykeeper.sqlite3` and `moneykeeper.ini` are kept beside the launcher by default. The database file can be changed from **Settings > Local data > Browse...**; restart Moneykeeper after saving the new location. The selected path is stored in the INI file, while the existing window geometry setting is preserved. The original `moneykeeper.pickle` is retained as an untouched archive. A restricted, one-time importer reads it only when the database has no existing ledger rows.
 
 Use **Settings > Create database backup** before major edits. Because file-sync services do not coordinate simultaneous SQLite writers, close Moneykeeper on one device and let its sync finish before opening it on another. Do not run two copies against the synced folder at the same time.
 

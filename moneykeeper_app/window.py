@@ -677,9 +677,10 @@ class ReconciliationPage(QWidget):
 
 
 class SettingsPage(QWidget):
-    def __init__(self, database: Database, on_changed, parent=None) -> None:
+    def __init__(self, database: Database, settings: QSettings, on_changed, parent=None) -> None:
         super().__init__(parent)
         self.database = database
+        self.settings = settings
         self.on_changed = on_changed
         self.inputs: dict[str, QDoubleSpinBox] = {}
 
@@ -717,17 +718,21 @@ class SettingsPage(QWidget):
         data_layout.setSpacing(12)
         heading = QLabel("Local data")
         heading.setObjectName("sectionTitle")
-        details = QLabel(
-            f"SQLite ledger\n{database.path}\n\n"
-            "The database and settings file are stored beside the launcher. "
-            "Keep one app instance open at a time while the folder syncs."
-        )
+        details = QLabel("Choose where Moneykeeper stores its SQLite ledger.")
         details.setObjectName("sectionNote")
         details.setWordWrap(True)
+        self.database_path = QLineEdit(str(database.path))
+        self.database_path.setReadOnly(True)
+        self.database_path.setToolTip("The new location is used after restarting Moneykeeper.")
+        self.database_browse_button = QPushButton("Browse...")
+        database_row = QHBoxLayout()
+        database_row.addWidget(self.database_path, 1)
+        database_row.addWidget(self.database_browse_button)
         self.backup_button = QPushButton("Create database backup...")
         self.backup_button.setObjectName("quietButton")
         data_layout.addWidget(heading)
         data_layout.addWidget(details)
+        data_layout.addLayout(database_row)
         data_layout.addStretch(1)
         data_layout.addWidget(self.backup_button)
         top_row.addWidget(data_section, 1)
@@ -761,6 +766,7 @@ class SettingsPage(QWidget):
         root.addWidget(category_section, 1)
 
         self.save_button.clicked.connect(self.save_settings)
+        self.database_browse_button.clicked.connect(self.choose_database_path)
         self.backup_button.clicked.connect(self.create_backup)
         self.add_category_button.clicked.connect(self.add_expense_type)
         self.edit_category_button.clicked.connect(self.edit_expense_type)
@@ -837,7 +843,36 @@ class SettingsPage(QWidget):
         state = self.database.load_state()
         state.update({key: spin.value() for key, spin in self.inputs.items()})
         self.database.save_state(state)
+        selected_path = Path(self.database_path.text()).expanduser()
+        if not selected_path.is_absolute():
+            selected_path = selected_path.resolve()
+        if not selected_path.parent.exists():
+            QMessageBox.warning(
+                self,
+                "Database folder not found",
+                f"Create this folder first:\n{selected_path.parent}",
+            )
+            return
+        current_path = self.settings.value("database/path", str(self.database.path))
+        if Path(str(current_path)).expanduser().resolve() != selected_path.resolve():
+            self.settings.setValue("database/path", str(selected_path))
+            self.settings.sync()
+            QMessageBox.information(
+                self,
+                "Database location saved",
+                "Restart Moneykeeper to use the new database location.",
+            )
         self.on_changed()
+
+    def choose_database_path(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Choose SQLite database",
+            self.database_path.text(),
+            "SQLite database (*.sqlite3 *.db);;All files (*.*)",
+        )
+        if path:
+            self.database_path.setText(str(Path(path).expanduser().resolve()))
 
     def create_backup(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -868,12 +903,15 @@ class MainWindow(QMainWindow):
     def __init__(self, data_directory: Path) -> None:
         super().__init__()
         self.data_directory = Path(data_directory)
-        self.database = Database(
-            self.data_directory / "moneykeeper.sqlite3",
-            self.data_directory / "moneykeeper.pickle",
-        )
         self.settings = QSettings(
             str(self.data_directory / "moneykeeper.ini"), QSettings.IniFormat
+        )
+        configured_database = self.settings.value(
+            "database/path", str(self.data_directory / "moneykeeper.sqlite3")
+        )
+        self.database = Database(
+            Path(str(configured_database)).expanduser(),
+            self.data_directory / "moneykeeper.pickle",
         )
         self.setWindowTitle("Moneykeeper")
         self.setMinimumSize(1060, 680)
@@ -913,7 +951,7 @@ class MainWindow(QMainWindow):
         self.reports = ReportsPage(self.database, self)
         self.reconciliation = ReconciliationPage(self.database, self.refresh_data, self)
         self.settings_page = SettingsPage(
-            self.database, self.refresh_data, self
+            self.database, self.settings, self.refresh_data, self
         )
         for page in (
             self.dashboard,
