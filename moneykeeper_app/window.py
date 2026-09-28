@@ -7,7 +7,7 @@ import sqlite3
 from datetime import date
 from pathlib import Path
 
-from PyQt5.QtCore import QDate, Qt, QSettings, QTimer
+from PyQt5.QtCore import QDate, QLocale, Qt, QSettings, QTimer
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -81,6 +81,11 @@ def make_table(headers: list[str], parent=None) -> QTableWidget:
     table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
     table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
     return table
+
+
+def configure_decimal_input(spin: QDoubleSpinBox) -> QDoubleSpinBox:
+    spin.setLocale(QLocale(QLocale.English, QLocale.UnitedStates))
+    return spin
 
 
 def metric_card(title: str, value: str, detail: str, accent: str = "green") -> QFrame:
@@ -252,11 +257,11 @@ class TransactionsPage(QWidget):
         self.through_enabled = QCheckBox("Through")
         self.through_date = QDateEdit(QDate.currentDate())
         self.through_date.setCalendarPopup(True)
-        self.minimum_amount = QDoubleSpinBox()
+        self.minimum_amount = configure_decimal_input(QDoubleSpinBox())
         self.minimum_amount.setRange(0, 999_999_999.99)
         self.minimum_amount.setDecimals(2)
         self.minimum_amount.setPrefix("Min € ")
-        self.maximum_amount = QDoubleSpinBox()
+        self.maximum_amount = configure_decimal_input(QDoubleSpinBox())
         self.maximum_amount.setRange(0, 999_999_999.99)
         self.maximum_amount.setDecimals(2)
         self.maximum_amount.setPrefix("Max € ")
@@ -581,7 +586,7 @@ class ReconciliationPage(QWidget):
 
     @staticmethod
     def _money_input() -> QDoubleSpinBox:
-        spin = QDoubleSpinBox()
+        spin = configure_decimal_input(QDoubleSpinBox())
         spin.setRange(-999_999_999.99, 999_999_999.99)
         spin.setDecimals(2)
         spin.setGroupSeparatorShown(True)
@@ -696,12 +701,17 @@ class SettingsPage(QWidget):
         form.setSpacing(14)
         form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         for key, label in (
+            ("budget", "Budget position"),
+            ("hold", "Hold position"),
             ("itohold", "Income directed to Hold (%)"),
             ("holdniv", "Hold target"),
             ("buffer", "Cash buffer"),
         ):
-            spin = QDoubleSpinBox()
-            spin.setRange(0, 100 if key == "itohold" else 999_999_999.99)
+            spin = configure_decimal_input(QDoubleSpinBox())
+            spin.setRange(
+                0 if key == "itohold" else -999_999_999.99,
+                100 if key == "itohold" else 999_999_999.99,
+            )
             spin.setDecimals(2)
             spin.setGroupSeparatorShown(True)
             self.inputs[key] = spin
@@ -855,14 +865,17 @@ class SettingsPage(QWidget):
             return
         current_path = self.settings.value("database/path", str(self.database.path))
         if Path(str(current_path)).expanduser().resolve() != selected_path.resolve():
-            self.settings.setValue("database/path", str(selected_path))
-            self.settings.sync()
+            self._save_database_path(selected_path)
             QMessageBox.information(
                 self,
                 "Database location saved",
                 "Restart Moneykeeper to use the new database location.",
             )
         self.on_changed()
+
+    def _save_database_path(self, path: Path) -> None:
+        self.settings.setValue("database/path", str(path))
+        self.settings.sync()
 
     def choose_database_path(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -872,7 +885,15 @@ class SettingsPage(QWidget):
             "SQLite database (*.sqlite3 *.db);;All files (*.*)",
         )
         if path:
-            self.database_path.setText(str(Path(path).expanduser().resolve()))
+            selected_path = Path(path).expanduser().resolve()
+            self.database_path.setText(str(selected_path))
+            if selected_path.parent.exists():
+                self._save_database_path(selected_path)
+                QMessageBox.information(
+                    self,
+                    "Database location saved",
+                    "Restart Moneykeeper to use the new database location.",
+                )
 
     def create_backup(self) -> None:
         path, _ = QFileDialog.getSaveFileName(

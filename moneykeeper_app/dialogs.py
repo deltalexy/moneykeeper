@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt5.QtCore import QDate
+from PyQt5.QtCore import QDate, QLocale
 from PyQt5.QtWidgets import (
     QComboBox,
     QDateEdit,
@@ -18,6 +18,11 @@ from PyQt5.QtWidgets import (
 
 from .database import Category, Transaction
 from .domain import parse_ledger_date
+
+
+def configure_decimal_input(spin: QDoubleSpinBox) -> QDoubleSpinBox:
+    spin.setLocale(QLocale(QLocale.English, QLocale.UnitedStates))
+    return spin
 
 
 class TransactionDialog(QDialog):
@@ -38,7 +43,7 @@ class TransactionDialog(QDialog):
             self.category.addItem(f"{category.label}  -  {category.code}", category.code)
         self.category.currentIndexChanged.connect(self._update_account_choice)
 
-        self.amount = QDoubleSpinBox()
+        self.amount = configure_decimal_input(QDoubleSpinBox())
         self.amount.setRange(0.01, 999_999_999.99)
         self.amount.setDecimals(2)
         self.amount.setSingleStep(1.0)
@@ -123,7 +128,7 @@ class EditTransactionDialog(QDialog):
             self.category.setCurrentIndex(index)
 
         self.description = QLineEdit(transaction.info)
-        self.amount = QDoubleSpinBox()
+        self.amount = configure_decimal_input(QDoubleSpinBox())
         self.amount.setRange(-999_999_999.99, 999_999_999.99)
         self.amount.setDecimals(2)
         self.amount.setGroupSeparatorShown(True)
