@@ -38,8 +38,11 @@ def transaction_balance_effect(
     state: dict,
     account: str | None = None,
 ) -> tuple[float, float, float]:
-    """Return (stored amount, budget delta, hold delta) for a positive input."""
-    amount = round(abs(amount), 2)
+    """Return (stored amount, budget delta, hold delta) for an input amount.
+
+    Negative inputs reverse the effect (refund, savings withdrawal, income correction).
+    """
+    amount = round(amount, 2)
     definition = (
         category
         if isinstance(category, Category)
@@ -64,6 +67,73 @@ def transaction_balance_effect(
     if (account or definition.account) == "hold":
         return -amount, 0.0, -amount
     return -amount, -amount, 0.0
+
+
+def monthly_category_comparison(
+    transactions: Iterable[Transaction],
+    categories: Iterable[Category],
+    year: int,
+    month: int,
+) -> list[tuple[str, float, float, float | None]]:
+    """Return selected-month spending and shares versus the prior 24-month mean."""
+    category_map = {
+        category.code: category for category in categories if category.flow == "expense"
+    }
+    selected_month = year * 12 + month - 1
+    current_totals: dict[str, float] = defaultdict(float)
+    historical_totals: dict[int, dict[str, float]] = defaultdict(
+        lambda: defaultdict(float)
+    )
+
+    for transaction in transactions:
+        when = parse_ledger_date(transaction.date)
+        category = category_map.get(transaction.kind)
+        if category is None:
+            continue
+
+        transaction_month = when.year * 12 + when.month - 1
+        if transaction_month == selected_month:
+            current_totals[transaction.kind] -= transaction.amount
+        elif selected_month - 24 <= transaction_month < selected_month:
+            historical_totals[transaction_month][transaction.kind] -= transaction.amount
+
+    historical_share_totals: dict[str, float] = defaultdict(float)
+    active_month_count = 0
+    for month_totals in historical_totals.values():
+        month_total = sum(max(amount, 0.0) for amount in month_totals.values())
+        if month_total <= 0:
+            continue
+        active_month_count += 1
+        for code in category_map:
+            historical_share_totals[code] += (
+                max(month_totals.get(code, 0.0), 0.0) / month_total
+            )
+
+    current_total = sum(max(amount, 0.0) for amount in current_totals.values())
+    comparison = []
+    for code, category in category_map.items():
+        amount = round(current_totals.get(code, 0.0), 2)
+        average_share = (
+            historical_share_totals[code] / active_month_count
+            if active_month_count
+            else None
+        )
+        if amount > 0 or (average_share is not None and average_share > 0):
+            comparison.append(
+                (
+                    category.label,
+                    amount,
+                    max(current_totals.get(code, 0.0), 0.0) / current_total
+                    if current_total
+                    else 0.0,
+                    average_share,
+                )
+            )
+    return sorted(
+        comparison,
+        key=lambda item: item[1],
+        reverse=True,
+    )
 
 
 def monthly_summary(transactions: Iterable[Transaction]) -> list[dict]:

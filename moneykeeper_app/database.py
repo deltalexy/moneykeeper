@@ -231,6 +231,22 @@ class Database:
             )
         return Transaction(cursor.lastrowid, date, kind, amount, info)
 
+    def transfer_funds(self, source: str, destination: str, amount: float) -> None:
+        """Move money between the budget and hold positions without a ledger entry."""
+        if {source, destination} != {"budget", "hold"}:
+            raise ValueError("Transfers must be between Budget and Hold")
+        amount = round(amount, 2)
+        if amount <= 0:
+            raise ValueError("The transfer amount must be greater than zero")
+        with self.connection:
+            state = self.load_state()
+            state[source] = round(float(state[source]) - amount, 2)
+            state[destination] = round(float(state[destination]) + amount, 2)
+            self.connection.executemany(
+                "INSERT OR REPLACE INTO app_state(key, value) VALUES (?, ?)",
+                [(key, json.dumps(state[key])) for key in ("budget", "hold")],
+            )
+
     def transactions(self) -> list[Transaction]:
         rows = self.connection.execute(
             "SELECT id, date, kind, amount, info FROM transactions ORDER BY id DESC"

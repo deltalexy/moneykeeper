@@ -36,8 +36,18 @@ from PyQt5.QtWidgets import (
 )
 
 from .database import Category, Database, Transaction
-from .dialogs import EditTransactionDialog, ExpenseTypeDialog, TransactionDialog
-from .domain import monthly_summary, parse_ledger_date, report_breakdown, transaction_balance_effect
+from .dialogs import (
+    EditTransactionDialog,
+    ExpenseTypeDialog,
+    TransactionDialog,
+    TransferDialog,
+)
+from .domain import (
+    monthly_category_comparison,
+    parse_ledger_date,
+    report_breakdown,
+    transaction_balance_effect,
+)
 
 
 class SortableItem(QTableWidgetItem):
@@ -108,11 +118,21 @@ def metric_card(title: str, value: str, detail: str, accent: str = "green") -> Q
 
 
 class DashboardPage(QWidget):
-    def __init__(self) -> None:
+    def __init__(self, database: Database, on_changed) -> None:
         super().__init__()
+        self.database = database
+        self.on_changed = on_changed
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(20)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        self.transfer_button = QPushButton("Transfer Budget / Hold")
+        self.transfer_button.setToolTip("Move money between Budget and Hold")
+        self.transfer_button.clicked.connect(self.transfer_funds)
+        actions.addWidget(self.transfer_button)
+        layout.addLayout(actions)
 
         self.cards_layout = QGridLayout()
         self.cards_layout.setSpacing(12)
@@ -120,17 +140,42 @@ class DashboardPage(QWidget):
 
         tables = QHBoxLayout()
         tables.setSpacing(16)
-        monthly_section = self._section("Monthly movement", "Income, spending, and net movement")
+        spending_section = self._section(
+            "Spending by category",
+            "Selected month vs the mean share of the 24 preceding months with spending",
+        )
         recent_section = self._section("Recent activity", "Latest entries in the ledger")
-        self.monthly_table = make_table(["Month", "Income", "Spending", "Saved", "Net"])
+        self.spending_month = QComboBox()
+        self.spending_month.currentIndexChanged.connect(
+            lambda _index: self._refresh_spending()
+        )
+        spending_section.layout().addWidget(self.spending_month)
+        self.spending_table = make_table(
+            ["Category", "Spent", "Share", "24-mo mean", "vs mean"]
+        )
         self.recent_table = make_table(["Date", "Category", "Description", "Amount"])
-        self.monthly_table.setMinimumHeight(360)
+        self.spending_table.setMinimumHeight(360)
         self.recent_table.setMinimumHeight(360)
-        monthly_section.layout().addWidget(self.monthly_table)
+        spending_section.layout().addWidget(self.spending_table)
         recent_section.layout().addWidget(self.recent_table)
-        tables.addWidget(monthly_section, 5)
+        tables.addWidget(spending_section, 5)
         tables.addWidget(recent_section, 6)
         layout.addLayout(tables, 1)
+        self._transactions: list[Transaction] = []
+        self._categories: list[Category] = []
+
+    def transfer_funds(self) -> None:
+        state = self.database.load_state()
+        dialog = TransferDialog(float(state["budget"]), float(state["hold"]), self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        source, destination, amount = dialog.values()
+        try:
+            self.database.transfer_funds(source, destination, amount)
+        except (sqlite3.Error, ValueError) as error:
+            QMessageBox.critical(self, "Could not transfer", str(error))
+            return
+        self.on_changed()
 
     @staticmethod
     def _section(title: str, subtitle: str) -> QFrame:
@@ -172,24 +217,22 @@ class DashboardPage(QWidget):
             metric_card("Ledger", f"{len(transactions):,}", "Recorded transactions", "gold"), 0, 3
         )
 
-        summaries = monthly_summary(transactions)[:12]
-        self.monthly_table.setSortingEnabled(False)
-        self.monthly_table.setRowCount(len(summaries))
-        for row, item in enumerate(summaries):
-            values = (
-                datetime_month(item["month"]),
-                money(item["income"]),
-                money(item["expenses"]),
-                money(item["savings"]),
-                money(item["net"]),
-            )
-            for column, value in enumerate(values):
-                cell = QTableWidgetItem(value)
-                if column > 0:
-                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.monthly_table.setItem(row, column, cell)
-        self.monthly_table.setSortingEnabled(True)
-        self.monthly_table.resizeColumnsToContents()
+        today = date.today()
+        self._transactions = transactions
+        self._categories = categories
+        selected_month = self.spending_month.currentData()
+        months = {today.strftime("%Y-%m")}
+        for transaction in transactions:
+            months.add(parse_ledger_date(transaction.date).strftime("%Y-%m"))
+        self.spending_month.blockSignals(True)
+        self.spending_month.clear()
+        for month in sorted(months, reverse=True):
+            self.spending_month.addItem(datetime_month(month), month)
+        selected_index = self.spending_month.findData(selected_month)
+        if selected_index >= 0:
+            self.spending_month.setCurrentIndex(selected_index)
+        self.spending_month.blockSignals(False)
+        self._refresh_spending()
 
         latest = transactions[:10]
         self.recent_table.setSortingEnabled(False)
@@ -210,6 +253,36 @@ class DashboardPage(QWidget):
             )
         self.recent_table.setSortingEnabled(True)
         self.recent_table.resizeColumnsToContents()
+
+    def _refresh_spending(self) -> None:
+        month = self.spending_month.currentData()
+        if not month:
+            return
+        year, month_number = (int(part) for part in month.split("-"))
+        spending = monthly_category_comparison(
+            self._transactions, self._categories, year, month_number
+        )
+        self.spending_table.setSortingEnabled(False)
+        self.spending_table.setRowCount(len(spending))
+        for row, (label, amount, share, average_share) in enumerate(spending):
+            mean_text = f"{average_share:.0%}" if average_share is not None else "N/A"
+            difference = share - average_share if average_share is not None else None
+            difference_text = (
+                f"{difference * 100:+.1f} pp" if difference is not None else "N/A"
+            )
+            cells = (
+                QTableWidgetItem(label),
+                SortableItem(money(amount), amount),
+                SortableItem(f"{share:.0%}", share),
+                SortableItem(mean_text, average_share),
+                SortableItem(difference_text, difference),
+            )
+            for column, cell in enumerate(cells):
+                if column > 0:
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.spending_table.setItem(row, column, cell)
+        self.spending_table.setSortingEnabled(True)
+        self.spending_table.resizeColumnsToContents()
 
 
 def datetime_month(month: str) -> str:
@@ -234,8 +307,6 @@ class TransactionsPage(QWidget):
         self.search_button = QPushButton("Search")
         self.search_button.setObjectName("quietButton")
         self.edit_button = QPushButton("Edit selected")
-        self.add_button = QPushButton("+  Add transaction")
-        self.add_button.setObjectName("primaryButton")
         self.filters_button = QPushButton("Filters")
         self.filters_button.setObjectName("quietButton")
         controls.addWidget(self.search, 1)
@@ -244,7 +315,6 @@ class TransactionsPage(QWidget):
         controls.addWidget(self.filters_button)
         controls.addSpacing(8)
         controls.addWidget(self.edit_button)
-        controls.addWidget(self.add_button)
         layout.addLayout(controls)
 
         self.filters_panel = QFrame()
@@ -302,7 +372,6 @@ class TransactionsPage(QWidget):
         self.maximum_amount.valueChanged.connect(self.refresh)
         self.from_date.dateChanged.connect(self.refresh)
         self.through_date.dateChanged.connect(self.refresh)
-        self.add_button.clicked.connect(self.add_transaction)
         self.edit_button.clicked.connect(self.edit_selected)
         self.table.doubleClicked.connect(self.edit_selected)
         self.refresh()
@@ -401,9 +470,10 @@ class TransactionsPage(QWidget):
 
 
 class ReportsPage(QWidget):
-    def __init__(self, database: Database, parent=None) -> None:
+    def __init__(self, database: Database, settings: QSettings, parent=None) -> None:
         super().__init__(parent)
         self.database = database
+        self.settings = settings
         self.report_rows: list[dict] = []
         self.report_categories: list[Category] = []
 
@@ -429,6 +499,8 @@ class ReportsPage(QWidget):
         self.table.setRootIsDecorated(True)
         self.table.setItemsExpandable(True)
         self.table.setSortingEnabled(False)
+        self.table.header().setSectionsMovable(True)
+        self.table.header().sectionMoved.connect(self._save_category_order)
         self.table.header().setStretchLastSection(True)
         section_layout.addWidget(self.table)
         layout.addWidget(section, 1)
@@ -441,7 +513,19 @@ class ReportsPage(QWidget):
 
     def refresh(self) -> None:
         transactions = self.database.transactions()
-        self.report_categories = self.database.categories()
+        categories = self.database.categories()
+        saved_order = self.settings.value("reports/category_order", [])
+        saved_codes = (
+            [str(code) for code in saved_order]
+            if isinstance(saved_order, (list, tuple))
+            else []
+        )
+        categories_by_code = {category.code: category for category in categories}
+        self.report_categories = [
+            categories_by_code.pop(code)
+            for code in saved_codes
+            if code in categories_by_code
+        ] + list(categories_by_code.values())
         self.report_rows = report_breakdown(transactions, self.report_categories)
         headers = ["Period", "Net"] + [
             f"{category.label} ({category.code})" for category in self.report_categories
@@ -449,6 +533,13 @@ class ReportsPage(QWidget):
         self.table.clear()
         self.table.setColumnCount(len(headers))
         self.table.setHeaderLabels(headers)
+        header = self.table.header()
+        was_blocked = header.blockSignals(True)
+        for logical_index in range(header.count()):
+            visual_index = header.visualIndex(logical_index)
+            if visual_index != logical_index:
+                header.moveSection(visual_index, logical_index)
+        header.blockSignals(was_blocked)
         year_items: list[QTreeWidgetItem] = []
         current_year_item = None
         for row in self.report_rows:
@@ -481,6 +572,17 @@ class ReportsPage(QWidget):
         self.table.setColumnWidth(0, 180)
         self.table.setColumnWidth(1, 140)
         self.count_label.setText(f"{len(self.report_rows):,} report periods")
+
+    def _save_category_order(self, *_args) -> None:
+        header = self.table.header()
+        category_codes = []
+        for visual_index in range(header.count()):
+            logical_index = header.logicalIndex(visual_index)
+            category_index = logical_index - 2
+            if 0 <= category_index < len(self.report_categories):
+                category_codes.append(self.report_categories[category_index].code)
+        self.settings.setValue("reports/category_order", category_codes)
+        self.settings.sync()
 
     def export_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -590,6 +692,7 @@ class ReconciliationPage(QWidget):
         spin.setRange(-999_999_999.99, 999_999_999.99)
         spin.setDecimals(2)
         spin.setGroupSeparatorShown(True)
+        spin.setKeyboardTracking(False)
         return spin
 
     @staticmethod
@@ -660,7 +763,6 @@ class ReconciliationPage(QWidget):
         self.database.save_state(self._state_from_inputs())
         self._dirty = False
         self.saved_label.setText("Saved automatically")
-        self.on_changed()
 
     def flush_pending_changes(self) -> None:
         self._save_timer.stop()
@@ -967,9 +1069,9 @@ class MainWindow(QMainWindow):
         content_layout.addLayout(header)
 
         self.stack = QStackedWidget()
-        self.dashboard = DashboardPage()
+        self.dashboard = DashboardPage(self.database, self.refresh_data)
         self.transactions = TransactionsPage(self.database, self.refresh_data, self)
-        self.reports = ReportsPage(self.database, self)
+        self.reports = ReportsPage(self.database, self.settings, self)
         self.reconciliation = ReconciliationPage(self.database, self.refresh_data, self)
         self.settings_page = SettingsPage(
             self.database, self.settings, self.refresh_data, self

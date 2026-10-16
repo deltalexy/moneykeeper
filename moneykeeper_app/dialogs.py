@@ -44,7 +44,7 @@ class TransactionDialog(QDialog):
         self.category.currentIndexChanged.connect(self._update_account_choice)
 
         self.amount = configure_decimal_input(QDoubleSpinBox())
-        self.amount.setRange(0.01, 999_999_999.99)
+        self.amount.setRange(-999_999_999.99, 999_999_999.99)
         self.amount.setDecimals(2)
         self.amount.setSingleStep(1.0)
         self.amount.setGroupSeparatorShown(True)
@@ -97,11 +97,52 @@ class TransactionDialog(QDialog):
         )
 
     def accept(self) -> None:
+        if self.amount.value() == 0:
+            self.amount.setFocus()
+            return
         if not self.description.text().strip():
             self.description.setFocus()
             self.description.setStyleSheet("border: 1px solid #bd5748;")
             return
         super().accept()
+
+
+class TransferDialog(QDialog):
+    """Move money between the Budget and Hold positions."""
+
+    def __init__(self, budget: float, hold: float, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Transfer between Budget and Hold")
+        self.setMinimumWidth(400)
+
+        self.direction = QComboBox()
+        self.direction.addItem(f"Budget  →  Hold   (Budget € {budget:,.2f})", ("budget", "hold"))
+        self.direction.addItem(f"Hold  →  Budget   (Hold € {hold:,.2f})", ("hold", "budget"))
+
+        self.amount = configure_decimal_input(QDoubleSpinBox())
+        self.amount.setRange(0.01, 999_999_999.99)
+        self.amount.setDecimals(2)
+        self.amount.setSingleStep(1.0)
+        self.amount.setGroupSeparatorShown(True)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        form.addRow("Direction", self.direction)
+        form.addRow("Amount", self.amount)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 20)
+        layout.setSpacing(18)
+        layout.addLayout(form)
+        layout.addWidget(self.buttons)
+
+    def values(self) -> tuple[str, str, float]:
+        source, destination = self.direction.currentData()
+        return source, destination, self.amount.value()
 
 
 class EditTransactionDialog(QDialog):
