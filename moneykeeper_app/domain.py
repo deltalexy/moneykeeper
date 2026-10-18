@@ -136,6 +136,43 @@ def monthly_category_comparison(
     )
 
 
+def category_spending_shares(
+    transactions: Iterable[Transaction],
+    categories: Iterable[Category],
+    start: date,
+    end: date,
+) -> list[tuple[str, float, float]]:
+    """Return net spending and category shares within an inclusive date range."""
+    if start > end:
+        raise ValueError("The start date must not be after the end date")
+
+    category_map = {
+        category.code: category for category in categories if category.flow == "expense"
+    }
+    totals: dict[str, float] = defaultdict(float)
+    for transaction in transactions:
+        when = parse_ledger_date(transaction.date)
+        if start <= when <= end and transaction.kind in category_map:
+            totals[transaction.kind] -= transaction.amount
+
+    total_spending = sum(max(amount, 0.0) for amount in totals.values())
+    if not total_spending:
+        return []
+    return sorted(
+        (
+            (
+                category.label,
+                round(totals[code], 2),
+                max(totals[code], 0.0) / total_spending,
+            )
+            for code, category in category_map.items()
+            if totals[code] > 0
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+
 def monthly_summary(transactions: Iterable[Transaction]) -> list[dict]:
     grouped: dict[str, dict[str, float]] = defaultdict(
         lambda: {"income": 0.0, "expenses": 0.0, "savings": 0.0}
@@ -164,11 +201,14 @@ def report_breakdown(
     transactions: Iterable[Transaction],
     categories: Iterable[Category],
     selected_year: int | None = None,
+    monthly_savings_gain_loss: dict[str, float] | None = None,
 ) -> list[dict]:
     """Build total, yearly, and monthly category totals like the original report."""
     category_map = {category.code: category for category in categories}
     totals: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     nets: dict[str, float] = defaultdict(float)
+    savings_gains: dict[str, float] = defaultdict(float)
+    savings_saved: dict[str, float] = defaultdict(float)
     year_months: dict[int, set[str]] = defaultdict(set)
     years: set[int] = set()
 
@@ -189,9 +229,28 @@ def report_breakdown(
         totals[year_key][transaction.kind] += transaction.amount
         totals[month_key][transaction.kind] += transaction.amount
         net_effect = 0.0 if category.flow == "saving" else transaction.amount
+        if category.flow == "saving":
+            savings_saved[year_key] += transaction.amount
+            savings_saved[month_key] += transaction.amount
+            savings_saved["total"] += transaction.amount
         nets["total"] += net_effect
         nets[year_key] += net_effect
         nets[month_key] += net_effect
+
+    for month_key, gain_loss in (monthly_savings_gain_loss or {}).items():
+        month_date = datetime.strptime(month_key, "%m/%Y").date()
+        year = month_date.year
+        if selected_year is not None and year != selected_year:
+            continue
+        year_key = str(year)
+        years.add(year)
+        year_months[year].add(month_key)
+        savings_gains[month_key] += gain_loss
+        savings_gains[year_key] += gain_loss
+        savings_gains["total"] += gain_loss
+        nets[month_key] += gain_loss
+        nets[year_key] += gain_loss
+        nets["total"] += gain_loss
 
     periods: list[tuple[str, str]] = [("Selected period total" if selected_year else "All time", "total")]
     for year in sorted(years, reverse=True):
@@ -207,6 +266,9 @@ def report_breakdown(
             "period": label,
             "level": "total" if key == "total" else "year" if key.isdigit() else "month",
             "net": round(nets[key], 2),
+            "net_excl_savings": round(nets[key] - savings_gains[key], 2),
+            "savings_gain_loss": round(savings_gains[key], 2),
+            "total_savings": round(savings_saved[key] + savings_gains[key], 2),
             "categories": {
                 category.code: round(totals[key].get(category.code, 0.0), 2)
                 for category in category_map.values()

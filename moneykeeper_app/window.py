@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QTextEdit,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTreeWidget,
@@ -39,14 +40,27 @@ from .database import Category, Database, Transaction
 from .dialogs import (
     EditTransactionDialog,
     ExpenseTypeDialog,
+    OpeningBalanceDialog,
+    PositionDialog,
+    SavingsAccountDialog,
+    SavingsTransferDialog,
     TransactionDialog,
     TransferDialog,
+    ValuationDialog,
 )
 from .domain import (
+    category_spending_shares,
     monthly_category_comparison,
     parse_ledger_date,
     report_breakdown,
     transaction_balance_effect,
+)
+from .savings import (
+    account_history,
+    current_positions,
+    load_savings_summaries,
+    monthly_savings_gain_loss,
+    total_savings_value,
 )
 
 
@@ -118,10 +132,11 @@ def metric_card(title: str, value: str, detail: str, accent: str = "green") -> Q
 
 
 class DashboardPage(QWidget):
-    def __init__(self, database: Database, on_changed) -> None:
+    def __init__(self, database: Database, on_changed, settings: QSettings) -> None:
         super().__init__()
         self.database = database
         self.on_changed = on_changed
+        self.settings = settings
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(20)
@@ -142,14 +157,49 @@ class DashboardPage(QWidget):
         tables.setSpacing(16)
         spending_section = self._section(
             "Spending by category",
-            "Selected month vs the mean share of the 24 preceding months with spending",
+            "Net category spending and share; monthly view also compares with the prior 24 months",
         )
         recent_section = self._section("Recent activity", "Latest entries in the ledger")
+        self.spending_period_mode = QComboBox()
+        self.spending_period_mode.addItem("Month", "month")
+        self.spending_period_mode.addItem("Year", "year")
+        self.spending_period_mode.addItem("Chosen period", "period")
         self.spending_month = QComboBox()
+        self.spending_year = QComboBox()
+        self.spending_dates = QWidget()
+        dates_layout = QHBoxLayout(self.spending_dates)
+        dates_layout.setContentsMargins(0, 0, 0, 0)
+        self.spending_from = QDateEdit(QDate.currentDate().addDays(-29))
+        self.spending_from.setCalendarPopup(True)
+        self.spending_from.setDisplayFormat("d MMM yyyy")
+        self.spending_from.setToolTip("Start date")
+        self.spending_through = QDateEdit(QDate.currentDate())
+        self.spending_through.setCalendarPopup(True)
+        self.spending_through.setDisplayFormat("d MMM yyyy")
+        self.spending_through.setToolTip("End date")
+        self.spending_through.setMinimumDate(self.spending_from.date())
+        self.spending_from.setMaximumDate(self.spending_through.date())
+        dates_layout.addWidget(QLabel("From"))
+        dates_layout.addWidget(self.spending_from)
+        dates_layout.addWidget(QLabel("Through"))
+        dates_layout.addWidget(self.spending_through)
+        period_controls = QHBoxLayout()
+        period_controls.addWidget(self.spending_period_mode)
+        period_controls.addWidget(self.spending_month, 1)
+        period_controls.addWidget(self.spending_year, 1)
+        period_controls.addWidget(self.spending_dates, 2)
+        spending_section.layout().addLayout(period_controls)
+        self.spending_period_mode.currentIndexChanged.connect(
+            self._update_spending_period_controls
+        )
         self.spending_month.currentIndexChanged.connect(
             lambda _index: self._refresh_spending()
         )
-        spending_section.layout().addWidget(self.spending_month)
+        self.spending_year.currentIndexChanged.connect(
+            lambda _index: self._refresh_spending()
+        )
+        self.spending_from.dateChanged.connect(self._spending_start_changed)
+        self.spending_through.dateChanged.connect(self._spending_end_changed)
         self.spending_table = make_table(
             ["Category", "Spent", "Share", "24-mo mean", "vs mean"]
         )
@@ -163,6 +213,7 @@ class DashboardPage(QWidget):
         layout.addLayout(tables, 1)
         self._transactions: list[Transaction] = []
         self._categories: list[Category] = []
+        self._update_spending_period_controls()
 
     def transfer_funds(self) -> None:
         state = self.database.load_state()
@@ -176,6 +227,21 @@ class DashboardPage(QWidget):
             QMessageBox.critical(self, "Could not transfer", str(error))
             return
         self.on_changed()
+
+    def _update_spending_period_controls(self, *_args) -> None:
+        mode = self.spending_period_mode.currentData()
+        self.spending_month.setVisible(mode == "month")
+        self.spending_year.setVisible(mode == "year")
+        self.spending_dates.setVisible(mode == "period")
+        self._refresh_spending()
+
+    def _spending_start_changed(self, value: QDate) -> None:
+        self.spending_through.setMinimumDate(value)
+        self._refresh_spending()
+
+    def _spending_end_changed(self, value: QDate) -> None:
+        self.spending_from.setMaximumDate(value)
+        self._refresh_spending()
 
     @staticmethod
     def _section(title: str, subtitle: str) -> QFrame:
@@ -204,8 +270,17 @@ class DashboardPage(QWidget):
 
         budget = float(state["budget"])
         hold = float(state["hold"])
+        savings = load_savings_summaries(self.database)
+        savings_value = total_savings_value(savings)
         self.cards_layout.addWidget(
-            metric_card("Net position", money(budget + hold), "Budget plus held funds", "green"), 0, 0
+            metric_card(
+                "Net position",
+                money(budget + hold),
+                "Budget plus held funds",
+                "green",
+            ),
+            0,
+            0,
         )
         self.cards_layout.addWidget(
             metric_card("Budget", money(budget), "Available for day-to-day spending", "coral"), 0, 1
@@ -216,14 +291,29 @@ class DashboardPage(QWidget):
         self.cards_layout.addWidget(
             metric_card("Ledger", f"{len(transactions):,}", "Recorded transactions", "gold"), 0, 3
         )
+        savings_gain = sum(item["gain"] or 0.0 for item in savings)
+        self.cards_layout.addWidget(
+            metric_card(
+                "Savings value",
+                money(savings_value),
+                f"Gain / loss {money(savings_gain)}" if savings else "No accounts tracked yet",
+                "green",
+            ),
+            0,
+            4,
+        )
 
         today = date.today()
         self._transactions = transactions
         self._categories = categories
         selected_month = self.spending_month.currentData()
+        selected_year = self.spending_year.currentData()
         months = {today.strftime("%Y-%m")}
+        years = {today.year}
         for transaction in transactions:
-            months.add(parse_ledger_date(transaction.date).strftime("%Y-%m"))
+            transaction_date = parse_ledger_date(transaction.date)
+            months.add(transaction_date.strftime("%Y-%m"))
+            years.add(transaction_date.year)
         self.spending_month.blockSignals(True)
         self.spending_month.clear()
         for month in sorted(months, reverse=True):
@@ -232,6 +322,14 @@ class DashboardPage(QWidget):
         if selected_index >= 0:
             self.spending_month.setCurrentIndex(selected_index)
         self.spending_month.blockSignals(False)
+        self.spending_year.blockSignals(True)
+        self.spending_year.clear()
+        for year in sorted(years, reverse=True):
+            self.spending_year.addItem(str(year), year)
+        selected_index = self.spending_year.findData(selected_year)
+        if selected_index >= 0:
+            self.spending_year.setCurrentIndex(selected_index)
+        self.spending_year.blockSignals(False)
         self._refresh_spending()
 
         latest = transactions[:10]
@@ -255,13 +353,32 @@ class DashboardPage(QWidget):
         self.recent_table.resizeColumnsToContents()
 
     def _refresh_spending(self) -> None:
-        month = self.spending_month.currentData()
-        if not month:
+        mode = self.spending_period_mode.currentData()
+        if not mode or self.spending_month.count() == 0:
             return
-        year, month_number = (int(part) for part in month.split("-"))
-        spending = monthly_category_comparison(
-            self._transactions, self._categories, year, month_number
-        )
+        monthly = mode == "month"
+        self.spending_table.setColumnHidden(3, not monthly)
+        self.spending_table.setColumnHidden(4, not monthly)
+        if monthly:
+            month = self.spending_month.currentData()
+            year, month_number = (int(part) for part in month.split("-"))
+            spending = monthly_category_comparison(
+                self._transactions, self._categories, year, month_number
+            )
+        else:
+            if mode == "year":
+                year = int(self.spending_year.currentData())
+                start = date(year, 1, 1)
+                end = date(year, 12, 31)
+            else:
+                start = self.spending_from.date().toPyDate()
+                end = self.spending_through.date().toPyDate()
+            spending = [
+                (label, amount, share, None)
+                for label, amount, share in category_spending_shares(
+                    self._transactions, self._categories, start, end
+                )
+            ]
         self.spending_table.setSortingEnabled(False)
         self.spending_table.setRowCount(len(spending))
         for row, (label, amount, share, average_share) in enumerate(spending):
@@ -430,7 +547,9 @@ class TransactionsPage(QWidget):
 
     def add_transaction(self) -> None:
         categories = self.database.categories()
-        dialog = TransactionDialog(categories, self)
+        dialog = TransactionDialog(
+            categories, self, savings_accounts=self.database.savings_accounts()
+        )
         if dialog.exec_() != QDialog.Accepted:
             return
         date_text, category, amount, description, account = dialog.values()
@@ -440,7 +559,13 @@ class TransactionsPage(QWidget):
         )
         try:
             self.database.add_transaction(
-                date_text, category.code, amount_value, description, budget_delta, hold_delta
+                date_text,
+                category.code,
+                amount_value,
+                description,
+                budget_delta,
+                hold_delta,
+                dialog.savings_account_id(),
             )
         except (sqlite3.Error, ValueError) as error:
             QMessageBox.critical(self, "Could not save", str(error))
@@ -455,7 +580,13 @@ class TransactionsPage(QWidget):
         transaction = next(
             item for item in self.database.transactions() if item.id == transaction_id
         )
-        dialog = EditTransactionDialog(transaction, self.database.categories(), self)
+        dialog = EditTransactionDialog(
+            transaction,
+            self.database.categories(),
+            self,
+            savings_accounts=self.database.savings_accounts(),
+            linked_account_id=self.database.savings_link(transaction_id),
+        )
         if dialog.exec_() != QDialog.Accepted:
             return
         date_text, kind, amount, description = dialog.values()
@@ -463,6 +594,7 @@ class TransactionsPage(QWidget):
             self.database.update_transaction_details(
                 transaction_id, date_text, kind, description, amount
             )
+            self.database.set_savings_link(transaction_id, dialog.savings_account_id())
         except sqlite3.Error as error:
             QMessageBox.critical(self, "Could not update", str(error))
             return
@@ -526,8 +658,12 @@ class ReportsPage(QWidget):
             for code in saved_codes
             if code in categories_by_code
         ] + list(categories_by_code.values())
-        self.report_rows = report_breakdown(transactions, self.report_categories)
-        headers = ["Period", "Net"] + [
+        self.report_rows = report_breakdown(
+            transactions,
+            self.report_categories,
+            monthly_savings_gain_loss=monthly_savings_gain_loss(self.database),
+        )
+        headers = ["Period", "Net excl. savings", "Net incl. savings", "Savings gain/loss", "Total savings"] + [
             f"{category.label} ({category.code})" for category in self.report_categories
         ]
         self.table.clear()
@@ -539,11 +675,27 @@ class ReportsPage(QWidget):
             visual_index = header.visualIndex(logical_index)
             if visual_index != logical_index:
                 header.moveSection(visual_index, logical_index)
+        saved_columns = self.settings.value("reports/column_order", [])
+        if isinstance(saved_columns, str):
+            saved_columns = [saved_columns]
+        keys = self._column_keys()
+        wanted = [key for key in (saved_columns or []) if key in keys]
+        wanted += [key for key in keys if key not in wanted]
+        for visual_index, key in enumerate(wanted):
+            current = header.visualIndex(keys.index(key))
+            if current != visual_index:
+                header.moveSection(current, visual_index)
         header.blockSignals(was_blocked)
         year_items: list[QTreeWidgetItem] = []
         current_year_item = None
         for row in self.report_rows:
-            values = [row["period"], money(row["net"])] + [
+            values = [
+                row["period"],
+                money(row["net_excl_savings"]),
+                money(row["net"]),
+                money(row["savings_gain_loss"]),
+                money(row["total_savings"]),
+            ] + [
                 money(row["categories"].get(category.code, 0.0))
                 for category in self.report_categories
             ]
@@ -551,7 +703,8 @@ class ReportsPage(QWidget):
             item.setData(0, Qt.UserRole, row["level"])
             for column in range(1, len(values)):
                 item.setTextAlignment(column, Qt.AlignRight | Qt.AlignVCenter)
-            item.setForeground(1, Qt.darkGreen if row["net"] >= 0 else Qt.darkRed)
+            item.setForeground(1, Qt.darkGreen if row["net_excl_savings"] >= 0 else Qt.darkRed)
+            item.setForeground(2, Qt.darkGreen if row["net"] >= 0 else Qt.darkRed)
             if row["level"] in ("total", "year"):
                 for column in range(len(values)):
                     font = item.font(column)
@@ -571,14 +724,28 @@ class ReportsPage(QWidget):
             year_items[0].setExpanded(True)
         self.table.setColumnWidth(0, 180)
         self.table.setColumnWidth(1, 140)
+        self.table.setColumnWidth(2, 140)
+        self.table.setColumnWidth(3, 160)
+        self.table.setColumnWidth(4, 140)
         self.count_label.setText(f"{len(self.report_rows):,} report periods")
+
+    def _column_keys(self) -> list[str]:
+        return ["_period", "_net_excl", "_net", "_savings", "_total_savings"] + [
+            category.code for category in self.report_categories
+        ]
 
     def _save_category_order(self, *_args) -> None:
         header = self.table.header()
+        keys = self._column_keys()
+        if header.count() == len(keys):
+            self.settings.setValue(
+                "reports/column_order",
+                [keys[header.logicalIndex(visual)] for visual in range(header.count())],
+            )
         category_codes = []
         for visual_index in range(header.count()):
             logical_index = header.logicalIndex(visual_index)
-            category_index = logical_index - 2
+            category_index = logical_index - 5
             if 0 <= category_index < len(self.report_categories):
                 category_codes.append(self.report_categories[category_index].code)
         self.settings.setValue("reports/category_order", category_codes)
@@ -597,12 +764,12 @@ class ReportsPage(QWidget):
             with open(path, "w", newline="", encoding="utf-8-sig") as report_file:
                 writer = csv.writer(report_file)
                 writer.writerow(
-                    ["Period", "Net"]
+                    ["Period", "Net excl. savings", "Net incl. savings", "Savings gain/loss", "Total savings"]
                     + [f"{category.label} ({category.code})" for category in self.report_categories]
                 )
                 for row in self.report_rows:
                     writer.writerow(
-                        [row["period"], row["net"]]
+                        [row["period"], row["net_excl_savings"], row["net"], row["savings_gain_loss"], row["total_savings"]]
                         + [row["categories"].get(category.code, 0.0) for category in self.report_categories]
                     )
         except OSError as error:
@@ -1014,11 +1181,445 @@ class SettingsPage(QWidget):
         QMessageBox.information(self, "Backup created", f"Database backup saved to:\n{path}")
 
 
+class SavingsPage(QWidget):
+    """Track savings and stock positions without changing the Budget or Hold balances."""
+
+    def __init__(self, database: Database, on_changed, parent=None) -> None:
+        super().__init__(parent)
+        self.database = database
+        self.on_changed = on_changed
+        self.summaries: list[dict] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        controls = QHBoxLayout()
+        self.add_account_button = QPushButton("+  Add account")
+        self.add_account_button.setObjectName("primaryButton")
+        self.edit_account_button = QPushButton("Edit account")
+        self.delete_account_button = QPushButton("Delete account")
+        self.delete_account_button.setObjectName("quietButton")
+        self.move_button = QPushButton("Move between accounts")
+        self.move_button.setToolTip("Move value from one savings account to another")
+        self.opening_button = QPushButton("Set starting value")
+        self.opening_button.setToolTip(
+            "Enter what the account already holds; it is not counted as gain or loss"
+        )
+        self.update_button = QPushButton("Update value")
+        self.update_button.setObjectName("primaryButton")
+        controls.addWidget(self.add_account_button)
+        controls.addWidget(self.edit_account_button)
+        controls.addWidget(self.delete_account_button)
+        controls.addStretch(1)
+        controls.addWidget(self.move_button)
+        controls.addWidget(self.opening_button)
+        controls.addWidget(self.update_button)
+        layout.addLayout(controls)
+
+        accounts_section = QFrame()
+        accounts_section.setObjectName("surface")
+        accounts_layout = QVBoxLayout(accounts_section)
+        accounts_layout.setContentsMargins(10, 10, 10, 10)
+        self.accounts_table = make_table(
+            ["Account", "Type", "Value", "Contributed", "Gain / loss", "Return", "Last update", "ID"]
+        )
+        self.accounts_table.setColumnHidden(7, True)
+        self.accounts_table.setMaximumHeight(210)
+        accounts_layout.addWidget(self.accounts_table)
+        layout.addWidget(accounts_section)
+
+        lower = QHBoxLayout()
+        lower.setSpacing(16)
+        history_section = DashboardPage._section(
+            "Value history", "Fluctuation excludes the money you added or withdrew"
+        )
+        self.history_table = make_table(
+            ["Date", "Value", "Contributed", "Gain / loss", "Fluctuation"]
+        )
+        history_section.layout().addWidget(self.history_table)
+        lower.addWidget(history_section, 5)
+
+        details_section = DashboardPage._section(
+            "Details", "Positions and the updates you recorded"
+        )
+        self.tabs = QTabWidget()
+        self.positions_table = make_table(["Symbol", "Name", "Quantity", "Price", "Value", "Share"])
+        self.valuations_table = make_table(["Date", "Value", "Note", "ID"])
+        self.valuations_table.setColumnHidden(3, True)
+        self.snapshots_table = make_table(["Date", "Symbol", "Quantity", "Price", "Value", "ID"])
+        self.snapshots_table.setColumnHidden(5, True)
+        self.tabs.addTab(self.positions_table, "Current positions")
+        self.tabs.addTab(self.valuations_table, "Value updates")
+        self.tabs.addTab(self.snapshots_table, "Position updates")
+        self.delete_entry_button = QPushButton("Delete selected update")
+        self.delete_entry_button.setObjectName("quietButton")
+        details_section.layout().addWidget(self.tabs)
+        details_section.layout().addWidget(self.delete_entry_button, 0, Qt.AlignRight)
+        lower.addWidget(details_section, 6)
+        layout.addLayout(lower, 1)
+
+        self.footer = QLabel()
+        self.footer.setObjectName("sectionNote")
+        layout.addWidget(self.footer)
+
+        self.add_account_button.clicked.connect(self.add_account)
+        self.edit_account_button.clicked.connect(self.edit_account)
+        self.delete_account_button.clicked.connect(self.delete_account)
+        self.move_button.clicked.connect(self.move_between_accounts)
+        self.opening_button.clicked.connect(self.set_opening_balance)
+        self.update_button.clicked.connect(self.update_selected)
+        self.delete_entry_button.clicked.connect(self.delete_entry)
+        self.accounts_table.itemSelectionChanged.connect(self._show_selected)
+        self.refresh()
+
+    def _selected_summary(self) -> dict | None:
+        row = self.accounts_table.currentRow()
+        if row < 0 or self.accounts_table.item(row, 7) is None:
+            return None
+        account_id = int(self.accounts_table.item(row, 7).text())
+        return next(
+            (item for item in self.summaries if item["account"].id == account_id), None
+        )
+
+    @staticmethod
+    def _signed_item(value: float | None, text: str | None = None) -> SortableItem:
+        item = SortableItem("-" if value is None else (text or money(value)), value)
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        if value is not None:
+            item.setForeground(Qt.darkGreen if value >= 0 else Qt.darkRed)
+        return item
+
+    @staticmethod
+    def _right(item: QTableWidgetItem) -> QTableWidgetItem:
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        return item
+
+    def refresh(self) -> None:
+        selected = self._selected_summary()
+        selected_id = selected["account"].id if selected else None
+        self.summaries = load_savings_summaries(self.database)
+
+        self.accounts_table.blockSignals(True)
+        self.accounts_table.setSortingEnabled(False)
+        self.accounts_table.setRowCount(len(self.summaries))
+        for row, summary in enumerate(self.summaries):
+            account = summary["account"]
+            value = summary["value"]
+            last_update = summary["last_update"]
+            cells = (
+                QTableWidgetItem(account.name),
+                QTableWidgetItem(
+                    f"{account.kind}  ({'positions' if account.tracking == 'positions' else 'value'})"
+                ),
+                self._right(SortableItem("-" if value is None else money(value), value)),
+                self._right(SortableItem(money(summary["contributed"]), summary["contributed"])),
+                self._signed_item(summary["gain"]),
+                self._signed_item(
+                    summary["return"],
+                    None if summary["return"] is None else f"{summary['return']:+.1%}",
+                ),
+                self._right(
+                    SortableItem(
+                        "-" if last_update is None else date_label(last_update.isoformat()),
+                        last_update,
+                    )
+                ),
+                QTableWidgetItem(str(account.id)),
+            )
+            for column, cell in enumerate(cells):
+                self.accounts_table.setItem(row, column, cell)
+        self.accounts_table.setSortingEnabled(True)
+        self.accounts_table.blockSignals(False)
+
+        target_row = 0 if self.summaries else -1
+        for row in range(self.accounts_table.rowCount()):
+            if int(self.accounts_table.item(row, 7).text()) == selected_id:
+                target_row = row
+                break
+        if target_row >= 0:
+            self.accounts_table.selectRow(target_row)
+        self._show_selected()
+
+        unlinked = self.database.unlinked_savings_total()
+        self.footer.setText(
+            f"Savings transactions not linked to an account: {money(unlinked)}. "
+            "Link them from Transactions > Edit selected."
+            if unlinked
+            else "Savings value is tracked separately and never changes Budget or Hold."
+        )
+
+    def _fill_history(self, summary: dict) -> None:
+        account = summary["account"]
+        account_id = account.id
+        valuations = self.database.valuations(account_id)
+        snapshots = self.database.holding_snapshots(account_id)
+        contributions = [
+            (when, amount)
+            for linked_id, when, amount in self.database.savings_contributions()
+            if linked_id == account_id
+        ]
+        history = list(reversed(account_history(account, valuations, snapshots, contributions)))
+
+        self.history_table.setSortingEnabled(False)
+        self.history_table.setRowCount(len(history))
+        for row, point in enumerate(history):
+            cells = (
+                SortableItem(date_label(point["date"].isoformat()), point["date"]),
+                self._right(SortableItem(money(point["value"]), point["value"])),
+                self._right(SortableItem(money(point["contributed"]), point["contributed"])),
+                self._signed_item(point["gain"]),
+                self._signed_item(point["fluctuation"]),
+            )
+            for column, cell in enumerate(cells):
+                self.history_table.setItem(row, column, cell)
+        self.history_table.setSortingEnabled(True)
+
+        positions = current_positions(snapshots)
+        holding_names = {item.id: item.name for item in self.database.savings_holdings(account_id)}
+        total = sum(item.quantity * item.price for item in positions)
+        self.positions_table.setSortingEnabled(False)
+        self.positions_table.setRowCount(len(positions))
+        for row, item in enumerate(positions):
+            position_value = item.quantity * item.price
+            share = position_value / total if total else 0.0
+            cells = (
+                QTableWidgetItem(item.symbol),
+                QTableWidgetItem(holding_names.get(item.holding_id, "")),
+                self._right(SortableItem(f"{item.quantity:,.6g}", item.quantity)),
+                self._right(SortableItem(f"{item.price:,.4f}", item.price)),
+                self._right(SortableItem(money(position_value), position_value)),
+                self._right(SortableItem(f"{share:.0%}", share)),
+            )
+            for column, cell in enumerate(cells):
+                self.positions_table.setItem(row, column, cell)
+        self.positions_table.setSortingEnabled(True)
+
+        self.valuations_table.setSortingEnabled(False)
+        self.valuations_table.setRowCount(len(valuations))
+        transfer_amounts = self.database.transfer_amounts()
+        previous_values: dict[int, float] = {}
+        deltas: dict[int, float] = {}
+        for item in valuations:
+            deltas[item.id] = item.value - previous_values.get(item.account_id, 0.0)
+            previous_values[item.account_id] = item.value
+        for row, item in enumerate(reversed(valuations)):
+            if item.note == self.database.TRANSFER_NOTE:
+                moved = transfer_amounts.get(item.id, deltas[item.id])
+                value_cell = self._signed_item(
+                    moved, f"{'+' if moved > 0 else ''}{money(moved)}"
+                )
+            else:
+                value_cell = self._right(SortableItem(money(item.value), item.value))
+            cells = (
+                SortableItem(date_label(item.date), parse_ledger_date(item.date)),
+                value_cell,
+                QTableWidgetItem(item.note),
+                QTableWidgetItem(str(item.id)),
+            )
+            for column, cell in enumerate(cells):
+                self.valuations_table.setItem(row, column, cell)
+        self.valuations_table.setSortingEnabled(True)
+
+        self.snapshots_table.setSortingEnabled(False)
+        self.snapshots_table.setRowCount(len(snapshots))
+        for row, item in enumerate(reversed(snapshots)):
+            cells = (
+                SortableItem(date_label(item.date), parse_ledger_date(item.date)),
+                QTableWidgetItem(item.symbol),
+                self._right(SortableItem(f"{item.quantity:,.6g}", item.quantity)),
+                self._right(SortableItem(f"{item.price:,.4f}", item.price)),
+                self._right(
+                    SortableItem(money(item.quantity * item.price), item.quantity * item.price)
+                ),
+                QTableWidgetItem(str(item.id)),
+            )
+            for column, cell in enumerate(cells):
+                self.snapshots_table.setItem(row, column, cell)
+        self.snapshots_table.setSortingEnabled(True)
+
+    def _show_selected(self) -> None:
+        summary = self._selected_summary()
+        has_account = summary is not None
+        self.edit_account_button.setEnabled(has_account)
+        self.delete_account_button.setEnabled(has_account)
+        self.update_button.setEnabled(has_account)
+        self.opening_button.setEnabled(has_account)
+        self.delete_entry_button.setEnabled(has_account)
+        if summary is None:
+            for table in (
+                self.history_table,
+                self.positions_table,
+                self.valuations_table,
+                self.snapshots_table,
+            ):
+                table.setRowCount(0)
+            return
+        positions = summary["account"].tracking == "positions"
+        self.update_button.setText("Update position" if positions else "Update value")
+        self.tabs.setTabEnabled(0, positions)
+        self.tabs.setTabEnabled(1, not positions)
+        self.tabs.setTabEnabled(2, positions)
+        self.tabs.setCurrentIndex(0 if positions else 1)
+        self._fill_history(summary)
+
+    def _report_error(self, title: str, error: Exception) -> None:
+        QMessageBox.critical(self, title, str(error))
+
+    def add_account(self) -> None:
+        dialog = SavingsAccountDialog(parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        name, kind, tracking = dialog.values()
+        try:
+            self.database.save_savings_account(name, kind, tracking)
+        except (sqlite3.Error, ValueError) as error:
+            self._report_error("Could not save account", error)
+            return
+        self.on_changed()
+        for row in range(self.accounts_table.rowCount()):
+            if self.accounts_table.item(row, 0).text() == name:
+                self.accounts_table.selectRow(row)
+                break
+
+    def edit_account(self) -> None:
+        summary = self._selected_summary()
+        if summary is None:
+            return
+        account = summary["account"]
+        dialog = SavingsAccountDialog(account, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        name, kind, tracking = dialog.values()
+        try:
+            self.database.save_savings_account(name, kind, tracking, account.id)
+        except (sqlite3.Error, ValueError) as error:
+            self._report_error("Could not save account", error)
+            return
+        self.on_changed()
+
+    def delete_account(self) -> None:
+        summary = self._selected_summary()
+        if summary is None:
+            return
+        account = summary["account"]
+        answer = QMessageBox.question(
+            self,
+            "Delete account",
+            f"Delete '{account.name}' and all of its recorded values and positions?\n\n"
+            "Ledger transactions are kept; only their link to this account is removed. "
+            "Budget and Hold are not affected.",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.database.delete_savings_account(account.id)
+        except sqlite3.Error as error:
+            self._report_error("Could not delete account", error)
+            return
+        self.on_changed()
+
+    def move_between_accounts(self) -> None:
+        accounts = self.database.savings_accounts()
+        if len(accounts) < 2:
+            QMessageBox.information(
+                self, "Move funds", "Add at least two savings accounts to move funds between them."
+            )
+            return
+        summary = self._selected_summary()
+        dialog = SavingsTransferDialog(
+            accounts, summary["account"].id if summary else None, self
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        try:
+            self.database.transfer_between_savings(*dialog.values())
+        except (sqlite3.Error, ValueError) as error:
+            self._report_error("Could not move funds", error)
+            return
+        self.on_changed()
+
+    def set_opening_balance(self) -> None:
+        summary = self._selected_summary()
+        if summary is None:
+            return
+        account = summary["account"]
+        dialog = OpeningBalanceDialog(
+            account.name,
+            account.tracking,
+            self.database.opening_balance(account.id),
+            self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        when, amount = dialog.values()
+        try:
+            self.database.set_opening_balance(account.id, when, amount)
+        except (sqlite3.Error, ValueError) as error:
+            self._report_error("Could not save starting value", error)
+            return
+        self.on_changed()
+
+    def update_selected(self) -> None:
+        summary = self._selected_summary()
+        if summary is None:
+            return
+        account = summary["account"]
+        try:
+            if account.tracking == "positions":
+                holdings = [
+                    (item.symbol, item.name)
+                    for item in self.database.savings_holdings(account.id)
+                ]
+                dialog = PositionDialog(account.name, holdings, self)
+                if dialog.exec_() != QDialog.Accepted:
+                    return
+                symbol, name, when, quantity, price = dialog.values()
+                self.database.add_holding_snapshot(
+                    account.id, symbol, name, when, quantity, price
+                )
+            else:
+                dialog = ValuationDialog(account.name, summary["value"], self)
+                if dialog.exec_() != QDialog.Accepted:
+                    return
+                when, value, note = dialog.values()
+                self.database.add_valuation(account.id, when, value, note)
+        except (sqlite3.Error, ValueError) as error:
+            self._report_error("Could not save update", error)
+            return
+        self.on_changed()
+
+    def delete_entry(self) -> None:
+        summary = self._selected_summary()
+        if summary is None:
+            return
+        positions = summary["account"].tracking == "positions"
+        table = self.snapshots_table if positions else self.valuations_table
+        id_column = 5 if positions else 3
+        row = table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self, "Delete update", "Select an update in the list first."
+            )
+            return
+        entry_id = int(table.item(row, id_column).text())
+        try:
+            if positions:
+                self.database.delete_holding_snapshot(entry_id)
+            else:
+                self.database.delete_valuation(entry_id)
+        except sqlite3.Error as error:
+            self._report_error("Could not delete update", error)
+            return
+        self.on_changed()
+
+
 class MainWindow(QMainWindow):
     PAGES = (
         ("Overview", "A clear view of your money"),
         ("Transactions", "Search and maintain the ledger"),
         ("Reports", "All-time, yearly, and monthly category totals"),
+        ("Savings", "Savings and stock positions, tracked apart from Budget and Hold"),
         ("Reconciliation", "Compare your accounts with Moneykeeper"),
         ("Settings", "Allocation, display, and data"),
     )
@@ -1069,9 +1670,10 @@ class MainWindow(QMainWindow):
         content_layout.addLayout(header)
 
         self.stack = QStackedWidget()
-        self.dashboard = DashboardPage(self.database, self.refresh_data)
+        self.dashboard = DashboardPage(self.database, self.refresh_data, self.settings)
         self.transactions = TransactionsPage(self.database, self.refresh_data, self)
         self.reports = ReportsPage(self.database, self.settings, self)
+        self.savings = SavingsPage(self.database, self.refresh_data, self)
         self.reconciliation = ReconciliationPage(self.database, self.refresh_data, self)
         self.settings_page = SettingsPage(
             self.database, self.settings, self.refresh_data, self
@@ -1080,6 +1682,7 @@ class MainWindow(QMainWindow):
             self.dashboard,
             self.transactions,
             self.reports,
+            self.savings,
             self.reconciliation,
             self.settings_page,
         ):
@@ -1143,6 +1746,7 @@ class MainWindow(QMainWindow):
         categories = self.database.categories()
         self.dashboard.refresh(state, transactions, categories)
         self.reports.refresh()
+        self.savings.refresh()
         self.reconciliation.refresh(state)
         self.settings_page.refresh(state)
         self.transactions.refresh()

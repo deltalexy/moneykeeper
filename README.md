@@ -41,7 +41,8 @@ This builds the executable first and creates `installer\Moneykeeper-Setup.exe`. 
 - `moneykeeper_app/database.py` owns SQLite reads and atomic writes.
 - `moneykeeper_app/domain.py` contains category labels, date parsing, summaries, and balance rules.
 - `moneykeeper_app/dialogs.py` contains transaction entry and metadata-edit dialogs.
-- `moneykeeper_app/window.py` contains the overview, transaction ledger, reports, reconciliation, and settings pages.
+- `moneykeeper_app/window.py` contains the overview, transaction ledger, savings, reports, reconciliation, and settings pages.
+- `moneykeeper_app/savings.py` contains valuation, contribution, and gain/loss maths for savings and stock accounts.
 - `moneykeeper_app/style.py` defines the shared interface theme.
 
 ## Data and sync
@@ -54,4 +55,10 @@ Use **Settings > Create database backup** before major edits. Because file-sync 
 
 ## Ledger behavior
 
-New income is allocated between Budget and Hold using the configured Hold target and percentage. Savings entries withdraw from Hold. Other expense categories debit the selected account. Expense labels and default accounts can be edited in Settings; stable category codes keep existing ledger rows intact. The Reports page shows all-time, yearly, and monthly totals by category, with savings displayed separately and excluded from net totals as in the original report. Reconciliation account names, amounts, and multiline notes save automatically after editing. Transaction amounts can be edited in the ledger; as in the original log editor, editing a historical amount updates reports but does not retroactively recalculate Budget or Hold.
+New income is allocated between Budget and Hold using the configured Hold target and percentage. Savings entries withdraw from Hold. Other expense categories debit the selected account. Expense labels and default accounts can be edited in Settings; stable category codes keep existing ledger rows intact. The Reports page shows all-time, yearly, and monthly totals by category, with savings displayed separately and excluded from net totals as in the original report. All Report columns (Period, the Net columns, Savings gain/loss, and categories) can be dragged into any order; the order is remembered between sessions.
+
+Budget and Hold can be moved between each other with transfers, and the Overview includes category spending shares for a selectable period.
+
+The Savings page tracks savings and stock accounts separately from Budget and Hold. Per account you can set a starting value, record value updates, keep holding snapshots (quantity and price per position), delete updates, and move funds between accounts. Savings transactions in the ledger can be linked to an account, and contributions plus gain/loss are calculated from those links and valuations. Monthly savings gain/loss and a Total savings column (savings deposits plus gain/loss for the period) appear in Reports.
+
+Reconciliation account names, amounts, and multiline notes save automatically after editing. Transaction amounts can be edited in the ledger; as in the original log editor, editing a historical amount updates reports but does not retroactively recalculate Budget or Hold.
